@@ -16,6 +16,8 @@ local os_sep = Path.path.sep
 
 local flatten = vim.tbl_flatten
 local filter = vim.tbl_filter
+local vapi = vim.api
+local vloop = vim.loop
 
 local files = {}
 
@@ -289,6 +291,83 @@ local function prepare_match(entry, kind)
   return entries
 end
 
+local function clear_buffer(absolute_path)
+  local bufs = vim.fn.getbufinfo({bufloaded = 1, buflisted = 1})
+  for _, buf in pairs(bufs) do
+    if buf.name == absolute_path then
+      if buf.hidden == 0 and #bufs > 1 then
+        local cur_win = vapi.nvim_get_current_win()
+        local buf_win = buf.windows[1]
+        vapi.nvim_set_current_win(buf_win)
+        vim.cmd(':bn')
+        if cur_win ~= buf_win then
+          vapi.nvim_set_current_win(winnr)
+        end
+      end
+      vapi.nvim_buf_delete(buf.bufnr, {})
+      return
+    end
+  end
+end
+
+local function rename_loaded_buffers(old_name, new_name)
+  for _, buf in pairs(vapi.nvim_list_bufs()) do
+    if vapi.nvim_buf_is_loaded(buf) then
+      if vapi.nvim_buf_get_name(buf) == old_name then
+        vapi.nvim_buf_set_name(buf, new_name)
+        -- to avoid the 'overwrite existing file' error message on write
+        vapi.nvim_buf_call(buf, function()
+          vim.cmd "silent! w!"
+        end)
+      end
+    end
+  end
+end
+
+local function path_join(paths)
+  return table.concat(paths, os_sep)
+end
+
+local function do_copy(source, destination)
+  local source_stats = vloop.fs_stat(source)
+
+  if source_stats and source_stats.type == 'file' then
+    return vloop.fs_copyfile(source, destination)
+  end
+
+  local handle = vloop.fs_scandir(source)
+
+  if type(handle) == 'string' then
+    return false, handle
+  end
+
+  vloop.fs_mkdir(destination, source_stats.mode)
+
+  while true do
+    local name, _ = vloop.fs_scandir_next(handle)
+    if not name then break end
+
+    local new_name = path_join({source, name})
+    local new_destination = path_join({destination, name})
+    local success, msg = do_copy(new_name, new_destination)
+    if not success then return success, msg end
+  end
+
+  return true
+end
+
+local function is_path_operational(path_obj)
+  if path_obj.filename == "../" or path_obj.filename == "./" then
+    print("Please select a file or a directory!")
+    return false
+  end
+  return true
+end
+
+local function get_path_type(path_obj)
+    return path_obj:is_dir() and "directory" or "file"
+end
+
 files.file_browser = function(opts)
   opts = opts or {}
 
@@ -381,7 +460,7 @@ files.file_browser = function(opts)
         current_picker:refresh(opts.new_finder(new_cwd), { reset_prompt = true })
       end)
 
-      local create_new_file = function()
+      local function create_new_file()
         local current_picker = action_state.get_current_picker(prompt_bufnr)
         local file = action_state.get_current_line()
         if file == "" then
@@ -415,8 +494,117 @@ files.file_browser = function(opts)
         end
       end
 
+      local function copy_file(prompt_bufnr)
+        local current_picker = action_state.get_current_picker(prompt_bufnr)
+        local selected_entry = action_state.get_selected_entry()
+        local selected_path = Path:new(selected_entry[1])
+        local selected_path_type = get_path_type(selected_path)
+
+        if not is_path_operational(selected_path) then
+          return
+        end
+
+        local new_name = Path:new(vim.fn.input("Copy to: ", selected_path:make_relative(), "file"))
+
+        if selected_path.filename == new_name.filename then
+          print("Original and new path are the same! Skipping.")
+          return
+        end
+
+        if new_name:exists() then
+          print(string.format("%s already exists! Skipping.", new_name.filename))
+          return
+        end
+
+        do_copy(selected_path:absolute(), new_name:absolute())
+        current_picker:refresh(opts.new_finder(current_picker.cwd), { reset_prompt = true })
+
+        vapi.nvim_command('redraw')
+        print("The " .. selected_path_type .. " has been copied.")
+
+      end
+
+      local function move_file(prompt_bufnr)
+        local current_picker = action_state.get_current_picker(prompt_bufnr)
+        local selected_entry = action_state.get_selected_entry()
+        local selected_path = Path:new(selected_entry[1])
+        local selected_path_type = get_path_type(selected_path)
+
+        if not is_path_operational(selected_path) then
+          return
+        end
+
+        local new_name = Path:new(vim.fn.input("Move to: ", selected_path:make_relative(), "file"))
+
+        if selected_path.filename == new_name.filename then
+          print("Original and new path are the same! Skipping.")
+          return
+        end
+
+        if new_name:exists() then
+          print(string.format("%s already exists! Skipping.", new_name.filename))
+          return
+        end
+
+        selected_path:rename({ new_name = new_name.filename })
+
+        rename_loaded_buffers(selected_path:absolute(), new_name:absolute())
+        current_picker:refresh(opts.new_finder(current_picker.cwd), { reset_prompt = true })
+
+        vapi.nvim_command('redraw')
+        print("The " .. selected_path_type .. " has been moved.")
+
+      end
+
+      local function remove_file(prompt_bufnr)
+        local current_picker = action_state.get_current_picker(prompt_bufnr)
+        local selected_entry = action_state.get_selected_entry()
+        local selected_path = Path:new(selected_entry[1])
+        local selected_path_type = get_path_type(selected_path)
+
+        if not is_path_operational(selected_path) then
+          return
+        end
+
+        print("This " .. selected_path_type .. " is going to be deleted:")
+        print(selected_path.filename)
+
+        local confirm = vim.fn.confirm(
+          "You're about to perform a destructive action." .. " Proceed? [y/N]: ",
+          "&Yes\n&No",
+          "No"
+        )
+
+        if confirm ~= 1 then
+            return
+        end
+
+        clear_buffer(selected_path:absolute())
+
+        selected_path:rm({ recursive = selected_path:is_dir() })
+
+        for result_index, result_entry in ipairs(current_picker.finder.results) do
+          if result_entry == selected_entry then
+            table.remove(current_picker.finder.results, result_index)
+          end
+        end
+
+        current_picker:refresh(opts.new_finder(current_picker.cwd))
+
+        vapi.nvim_command('redraw')
+        print("The " .. selected_path_type .. " has been removed.")
+
+      end
+
       map("i", "<C-e>", create_new_file)
       map("n", "<C-e>", create_new_file)
+      map("i", "<c-d>", remove_file)
+      map("n", "<c-d>", remove_file)
+      map("i", "<c-r>", move_file)
+      map("n", "<c-r>", move_file)
+      map("i", "<c-k>", copy_file)
+      map("n", "<c-k>", copy_file)
+
       return true
     end,
   }):find()
